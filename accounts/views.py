@@ -7,6 +7,8 @@ from .serializers import CampusPulseTokenSerializer
 
 class LoginView(TokenObtainPairView):
     serializer_class = CampusPulseTokenSerializer
+    permission_classes = [AllowAny]
+    
 class RegisterView(generics.CreateAPIView):
     serializer_class = RegisterSerializer
     permission_classes = [AllowAny]
