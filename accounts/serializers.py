@@ -42,7 +42,7 @@ class RegisterSerializer(serializers.ModelSerializer):
             password=validated_data["password"],
             role=User.Role.STUDENT,
             email_verified=False,
-            is_active=False,
+            is_active=True,
         )
 
         return user
