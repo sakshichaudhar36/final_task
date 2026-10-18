@@ -3,6 +3,7 @@ from django.db import models
 from campus.models import CampusLocation
 def evidence_upload_path(instance, filename):
     return f"private_evidence/complaint_{instance.complaint_id}/{filename}"
+
 class Complaint(models.Model):
     class Status(models.TextChoices):
         SUBMITTED = "submitted", "Submitted"
@@ -11,6 +12,7 @@ class Complaint(models.Model):
         RESOLVED = "resolved", "Resolved"
         VERIFIED = "verified", "Verified / Closed"
         REOPENED = "reopened", "Reopened"
+
 
     class Priority(models.TextChoices):
         LOW = "low", "Low"
@@ -31,6 +33,7 @@ class Complaint(models.Model):
     title = models.CharField(max_length=200)
     description = models.TextField()
     category = models.CharField(max_length=80)
+    suggested_category = models.CharField(max_length=80,blank=True,default="",)
     priority = models.CharField(
         max_length=10,
         choices=Priority.choices,

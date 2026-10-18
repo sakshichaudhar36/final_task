@@ -2,12 +2,15 @@ from django.contrib.auth import get_user_model
 from rest_framework import serializers
 from campus.models import CampusLocation
 from .models import Complaint, ComplaintHistory, Evidence
+
 User = get_user_model()
 class ComplaintSerializer(serializers.ModelSerializer):
     reporter_username = serializers.CharField(
         source="reporter.username",
         read_only=True,
     )
+    category = serializers.CharField(required=False,default="other",write_only=True,)
+    suggested_category = serializers.CharField(read_only=True,)
     assigned_staff_username = serializers.CharField(
         source="assigned_staff.username",
         read_only=True,
@@ -20,6 +23,7 @@ class ComplaintSerializer(serializers.ModelSerializer):
             "title",
             "description",
             "category",
+            "suggested_category",
             "location",
             "reporter",
             "reporter_username",
@@ -43,6 +47,7 @@ class ComplaintSerializer(serializers.ModelSerializer):
             "updated_at",
             "resolved_at",
             "verified_at",
+            "suggested_category"
         ]
 class AssignmentSerializer(serializers.Serializer):
     staff_id = serializers.IntegerField()

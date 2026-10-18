@@ -1,3 +1,4 @@
+from .ml_service import predict_complaint
 from django.contrib.auth import get_user_model
 from django.db.models import Count, Q
 from django.utils import timezone
@@ -52,11 +53,33 @@ class ComplaintViewSet(viewsets.ModelViewSet):
             raise ValidationError({
                 "location": "Select an active campus location."
             })
-
+        title = serializer.validated_data["title"]
+        description = serializer.validated_data["description"]
+        ml_result = predict_complaint(title, description)
+        # Map ML category to Django category values
+        suggested_category = ""
+        if ml_result and ml_result.get("ml_available", True):
+                predicted = ml_result.get("category")
+                if isinstance(predicted, str):
+                            category_mapping = {
+                                "electrical": "electrical",
+                                "electricity": "electrical",
+                                "plumbing": "plumbing",
+                                "water": "plumbing",
+                                "cleanliness": "cleanliness",
+                                "cleaning": "cleanliness",
+                                "civil": "civil",
+                                "civil maintenance": "civil",
+                                "other": "other",
+                            }
+                            suggested_category = category_mapping.get(predicted.strip().lower(), "")
+                            
         complaint = serializer.save(
             reporter=self.request.user,
             status=Complaint.Status.SUBMITTED,
+            suggested_category=suggested_category,
         )
+        
         record_history(
             complaint,
             self.request.user,
