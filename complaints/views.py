@@ -1,456 +1,354 @@
-from django.db import transaction
-from django.db.models import Q
+from django.contrib.auth import get_user_model
+from django.db.models import Count, Q
 from django.utils import timezone
-
 from rest_framework import status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.exceptions import PermissionDenied, ValidationError
-
+from accounts.permissions import IsManagement
+from campus.models import CampusLocation
 from .models import Complaint, ComplaintHistory, Evidence
+from .permissions import ComplaintPermission
 from .serializers import (
     ComplaintSerializer,
-    ComplaintHistorySerializer,
+    AssignmentSerializer,
+    StatusUpdateSerializer,
+    VerificationSerializer,
+    ReopenSerializer,
     EvidenceSerializer,
+    ComplaintHistorySerializer,
+    PublicComplaintSerializer,
 )
-from .permissions import IsManagement, ComplaintObjectPermission
-from campus.models import CampusLocation
-
-
+User = get_user_model()
+def record_history(complaint, actor, action, old_status="", reason=""):
+    ComplaintHistory.objects.create(
+        complaint=complaint,
+        actor=actor,
+        action=action,
+        previous_status=old_status,
+        new_status=complaint.status,
+        reason=reason,
+    )
 class ComplaintViewSet(viewsets.ModelViewSet):
     serializer_class = ComplaintSerializer
-    permission_classes = [IsAuthenticated, ComplaintObjectPermission]
-
+    permission_classes = [IsAuthenticated, ComplaintPermission]
     def get_queryset(self):
         user = self.request.user
-
+        queryset = Complaint.objects.select_related(
+            "reporter", "assigned_staff", "location"
+        ).order_by("-created_at")
         if user.role == "management":
-            return Complaint.objects.select_related(
-                "reporter", "assigned_staff", "location"
-            ).all()
-
+            return queryset
         if user.role == "staff":
-            return Complaint.objects.filter(
-                assigned_staff=user
-            ).select_related("reporter", "location")
-
-        return Complaint.objects.filter(
-            reporter=user
-        ).select_related("location")
-
+            return queryset.filter(assigned_staff=user)
+        return queryset.filter(reporter=user)
     def perform_create(self, serializer):
-        user = self.request.user
-
-        if user.role != "student":
-            raise PermissionDenied(
-                "Only students can submit complaints in this workflow."
-            )
-
-        if not user.email_verified:
-            raise PermissionDenied(
-                "Verify your college email before reporting a problem."
-            )
-
-        location = serializer.validated_data["location"]
-
-        if not location.is_active:
+        location_id = self.request.data.get("location")
+        if not CampusLocation.objects.filter(
+            pk=location_id,
+            is_active=True,
+        ).exists():
             raise ValidationError({
-                "location": "This campus location is inactive."
+                "location": "Select an active campus location."
             })
 
-        with transaction.atomic():
-            complaint = serializer.save(
-                reporter=user,
-                status=Complaint.Status.SUBMITTED,
-                is_public=False,
-            )
-
-            ComplaintHistory.objects.create(
-                complaint=complaint,
-                actor=user,
-                old_status="",
-                new_status=Complaint.Status.SUBMITTED,
-                reason="Complaint submitted",
-            )
-
-    def update(self, request, *args, **kwargs):
-        raise PermissionDenied(
-            "Use the dedicated complaint workflow endpoints."
+        complaint = serializer.save(
+            reporter=self.request.user,
+            status=Complaint.Status.SUBMITTED,
         )
-
+        record_history(
+            complaint,
+            self.request.user,
+            "submitted",
+            reason="Complaint submitted",
+        )
+    def update(self, request, *args, **kwargs):
+        # General edits are not permitted through the detail endpoint.
+        # Use the dedicated actions for status, assignment and verification.
+        raise PermissionDenied(
+            "Use the specific complaint actions to make changes."
+        )
     def partial_update(self, request, *args, **kwargs):
         raise PermissionDenied(
-            "Use the dedicated complaint workflow endpoints."
+            "Use the specific complaint actions to make changes."
         )
-
-    def destroy(self, request, *args, **kwargs):
-        raise PermissionDenied(
-            "Complaints cannot be deleted through this endpoint."
-        )
-
-    @action(detail=True, methods=["patch"])
+    @action(detail=True, methods=["patch"], permission_classes=[
+        IsAuthenticated, IsManagement
+    ])
     def assign(self, request, pk=None):
         complaint = self.get_object()
-
-        if request.user.role != "management":
-            raise PermissionDenied(
-                "Only management can assign complaints."
-            )
-
-        staff_id = request.data.get("staff_id")
-
-        from django.contrib.auth import get_user_model
-        User = get_user_model()
-
-        staff = User.objects.filter(
-            id=staff_id,
-            role="staff",
-            is_active=True,
-            email_verified=True,
-        ).first()
-
-        if not staff:
-            raise ValidationError({
-                "staff_id": "A valid, active staff member is required."
-            })
-
+        serializer = AssignmentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        staff = User.objects.get(
+            pk=serializer.validated_data["staff_id"]
+        )
         old_status = complaint.status
+        complaint.assigned_staff = staff
 
-        with transaction.atomic():
-            complaint.assigned_staff = staff
+        if complaint.status in [
+            Complaint.Status.SUBMITTED,
+            Complaint.Status.REOPENED,
+        ]:
+            complaint.status = Complaint.Status.ASSIGNED
 
-            if complaint.status == Complaint.Status.SUBMITTED:
-                complaint.status = Complaint.Status.ASSIGNED
+        complaint.save()
+        record_history(
+            complaint,
+            request.user,
+            "assigned",
+            old_status=old_status,
+            reason=f"Assigned to {staff.username}",
+        )
 
-            complaint.save(
-                update_fields=["assigned_staff", "status", "updated_at"]
-            )
+        return Response(ComplaintSerializer(complaint).data)
 
-            ComplaintHistory.objects.create(
-                complaint=complaint,
-                actor=request.user,
-                old_status=old_status,
-                new_status=complaint.status,
-                reason=f"Assigned to staff ID {staff.id}",
-            )
-
-        return Response(self.get_serializer(complaint).data)
-
-    @action(detail=True, methods=["patch"])
+    @action(detail=True, methods=["patch"], permission_classes=[
+        IsAuthenticated
+    ])
     def update_status(self, request, pk=None):
         complaint = self.get_object()
         user = request.user
 
-        new_status = request.data.get("status")
-        reason = request.data.get("reason", "")
-
-        if new_status not in [
-            Complaint.Status.IN_PROGRESS,
-            Complaint.Status.RESOLVED,
-        ]:
-            raise ValidationError({
-                "status": "Use the verification endpoint for closure."
-            })
-
-        if user.role == "staff":
-            if complaint.assigned_staff_id != user.id:
-                raise PermissionDenied(
-                    "You can update only your assigned complaints."
-                )
-
-        elif user.role != "management":
+        if user.role != "management" and not (
+            user.role == "staff"
+            and complaint.assigned_staff_id == user.id
+        ):
             raise PermissionDenied(
-                "You cannot change this complaint's status."
+                "Only assigned staff or management can update status."
             )
 
-        if new_status == Complaint.Status.IN_PROGRESS:
-            if complaint.status not in [
-                Complaint.Status.ASSIGNED,
-                Complaint.Status.IN_PROGRESS,
-            ]:
-                raise ValidationError(
-                    "This complaint cannot enter progress from its current status."
-                )
+        serializer = StatusUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
 
+        new_status = serializer.validated_data["status"]
+        reason = serializer.validated_data.get("reason", "")
+        old_status = complaint.status
+
+        allowed = {
+            Complaint.Status.ASSIGNED: [
+                Complaint.Status.IN_PROGRESS,
+            ],
+            Complaint.Status.IN_PROGRESS: [
+                Complaint.Status.RESOLVED,
+            ],
+            Complaint.Status.REOPENED: [
+                Complaint.Status.IN_PROGRESS,
+            ],
+        }
+
+        if user.role != "management":
+            if new_status not in allowed.get(old_status, []):
+                raise ValidationError({
+                    "status": f"Cannot change status from {old_status} to {new_status}."
+                })
+
+        complaint.status = new_status
         if new_status == Complaint.Status.RESOLVED:
-            if complaint.status not in [
-                Complaint.Status.ASSIGNED,
-                Complaint.Status.IN_PROGRESS,
-            ]:
-                raise ValidationError(
-                    "Only assigned or in-progress complaints can be resolved."
-                )
+            complaint.resolved_at = timezone.now()
+        elif new_status == Complaint.Status.IN_PROGRESS:
+            complaint.resolved_at = None
+            complaint.verified_at = None
 
-            if not complaint.evidence.exists():
-                raise ValidationError(
-                    "Upload repair evidence before marking the complaint resolved."
-                )
-
-        old_status = complaint.status
-
-        with transaction.atomic():
-            complaint.status = new_status
-
-            if new_status == Complaint.Status.RESOLVED:
-                complaint.resolution_note = reason
-
-            complaint.save()
-
-            ComplaintHistory.objects.create(
-                complaint=complaint,
-                actor=user,
-                old_status=old_status,
-                new_status=new_status,
-                reason=reason,
-            )
-
-        return Response(self.get_serializer(complaint).data)
-
-    @action(detail=True, methods=["post"])
-    def verify(self, request, pk=None):
-        complaint = self.get_object()
-
-        if request.user.role not in ["student", "management"]:
-            raise PermissionDenied(
-                "Only the reporting student or management can verify resolution."
-            )
-
-        if (
-            request.user.role == "student"
-            and complaint.reporter_id != request.user.id
-        ):
-            raise PermissionDenied(
-                "You can verify only your own complaint."
-            )
-
-        if complaint.status != Complaint.Status.RESOLVED:
-            raise ValidationError(
-                "Only resolved complaints can be verified."
-            )
-
-        approved = request.data.get("approved")
-
-        if not isinstance(approved, bool):
-            raise ValidationError({
-                "approved": "Provide true or false."
-            })
-
-        reason = request.data.get("reason", "")
-
-        if not approved and not reason.strip():
-            raise ValidationError({
-                "reason": "Provide a reason for reopening."
-            })
-
-        old_status = complaint.status
-
-        with transaction.atomic():
-            if approved:
-                complaint.status = Complaint.Status.CLOSED
-                complaint.resolution_verified = True
-                complaint.is_public = True
-                complaint.closed_at = timezone.now()
-                history_reason = "Resolution verified"
-            else:
-                complaint.status = Complaint.Status.IN_PROGRESS
-                complaint.resolution_verified = False
-                complaint.is_public = False
-                complaint.closed_at = None
-                history_reason = reason
-
-            complaint.save()
-
-            ComplaintHistory.objects.create(
-                complaint=complaint,
-                actor=request.user,
-                old_status=old_status,
-                new_status=complaint.status,
-                reason=history_reason,
-            )
-
-        return Response(self.get_serializer(complaint).data)
-
-    @action(detail=True, methods=["post"])
-    def reopen(self, request, pk=None):
-        complaint = self.get_object()
-
-        if (
-            request.user.role != "student"
-            or complaint.reporter_id != request.user.id
-        ):
-            raise PermissionDenied(
-                "Only the reporting student can request reopening."
-            )
-
-        if complaint.status != Complaint.Status.CLOSED:
-            raise ValidationError(
-                "Only closed complaints can be reopened using this endpoint."
-            )
-
-        reason = request.data.get("reason", "").strip()
-
-        if not reason:
-            raise ValidationError({
-                "reason": "A reopening reason is required."
-            })
-
-        old_status = complaint.status
-
-        with transaction.atomic():
-            complaint.status = Complaint.Status.IN_PROGRESS
-            complaint.resolution_verified = False
-            complaint.is_public = False
-            complaint.closed_at = None
-            complaint.save()
-
-            ComplaintHistory.objects.create(
-                complaint=complaint,
-                actor=request.user,
-                old_status=old_status,
-                new_status=complaint.status,
-                reason=reason,
-            )
-
-        return Response(self.get_serializer(complaint).data)
-
-    @action(detail=True, methods=["get"])
-    def history(self, request, pk=None):
-        complaint = self.get_object()
-
-        history = complaint.history.select_related("actor").order_by(
-            "created_at"
+        complaint.save()
+        record_history(
+            complaint,
+            user,
+            "status_updated",
+            old_status=old_status,
+            reason=reason,
         )
-
-        return Response(
-            ComplaintHistorySerializer(history, many=True).data
-        )
-
-    @action(detail=True, methods=["post"])
+        return Response(ComplaintSerializer(complaint).data)
+    @action(detail=True, methods=["post"], permission_classes=[
+        IsAuthenticated
+    ])
     def evidence(self, request, pk=None):
         complaint = self.get_object()
         user = request.user
 
-        if (
-            user.role != "staff"
-            or complaint.assigned_staff_id != user.id
+        if user.role != "management" and not (
+            user.role == "staff"
+            and complaint.assigned_staff_id == user.id
         ):
-            if user.role != "management":
-                raise PermissionDenied(
-                    "Only assigned staff or authorized management can upload evidence."
-                )
+            raise PermissionDenied(
+                "Only assigned staff or management can upload evidence."
+            )
 
-        serializer = EvidenceSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+        if complaint.status not in [
+            Complaint.Status.IN_PROGRESS,
+            Complaint.Status.RESOLVED,
+        ]:
+            raise ValidationError(
+                "Evidence can be uploaded while work is in progress or resolved."
+            )
 
         uploaded_file = request.FILES.get("file")
-
         if not uploaded_file:
-            raise ValidationError({
-                "file": "An evidence file is required."
-            })
+            raise ValidationError({"file": "A file is required."})
 
-        max_size = 5 * 1024 * 1024
-
-        if uploaded_file.size > max_size:
-            raise ValidationError({
-                "file": "Maximum file size is 5 MB."
-            })
+        if uploaded_file.size > 5 * 1024 * 1024:
+            raise ValidationError({"file": "Maximum file size is 5 MB."})
 
         allowed_types = {
             "image/jpeg",
             "image/png",
             "application/pdf",
         }
-
         if uploaded_file.content_type not in allowed_types:
             raise ValidationError({
-                "file": "Only JPEG, PNG or PDF files are accepted."
+                "file": "Only JPEG, PNG, or PDF evidence is accepted."
             })
 
+        serializer = EvidenceSerializer(data={
+            "file": uploaded_file,
+            "description": request.data.get("description", ""),
+        })
+        serializer.is_valid(raise_exception=True)
         evidence = serializer.save(
             complaint=complaint,
             uploaded_by=user,
-            file=uploaded_file,
         )
-
+        record_history(
+            complaint,
+            user,
+            "evidence_uploaded",
+            reason="Evidence uploaded",
+        )
         return Response(
-            {
-                "message": "Evidence uploaded successfully.",
-                "evidence_id": evidence.id,
-            },
+            EvidenceSerializer(evidence).data,
             status=status.HTTP_201_CREATED,
         )
+    @action(detail=True, methods=["post"], permission_classes=[
+        IsAuthenticated
+    ])
+    def verify(self, request, pk=None):
+        complaint = self.get_object()
+        user = request.user
+        if user.role != "management" and complaint.reporter_id != user.id:
+            raise PermissionDenied(
+                "Only the reporter or management can verify resolution."
+            )
+        if complaint.status != Complaint.Status.RESOLVED:
+            raise ValidationError(
+                "Only resolved complaints can be verified."
+            )
+        serializer = VerificationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        approved = serializer.validated_data["approved"]
+        reason = serializer.validated_data.get("reason", "")
+        old_status = complaint.status
 
+        if approved:
+            complaint.status = Complaint.Status.VERIFIED
+            complaint.verified_at = timezone.now()
+            complaint.is_public = True
+            action_name = "resolution_verified"
+        else:
+            complaint.status = Complaint.Status.REOPENED
+            complaint.verified_at = None
+            complaint.resolved_at = None
+            complaint.is_public = False
+            action_name = "resolution_rejected"
+        complaint.save()
+        record_history(
+            complaint,
+            user,
+            action_name,
+            old_status=old_status,
+            reason=reason,
+        )
+        return Response(ComplaintSerializer(complaint).data)
+    @action(detail=True, methods=["post"], permission_classes=[
+        IsAuthenticated
+    ])
+    def reopen(self, request, pk=None):
+        complaint = self.get_object()
+        user = request.user
+        if user.role != "management" and complaint.reporter_id != user.id:
+            raise PermissionDenied(
+                "Only the reporter or management can reopen a complaint."
+            )
+        if complaint.status not in [
+            Complaint.Status.RESOLVED,
+            Complaint.Status.VERIFIED,
+        ]:
+            raise ValidationError(
+                "Only resolved or verified complaints can be reopened."
+            )
+        serializer = ReopenSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        old_status = complaint.status
+        complaint.status = Complaint.Status.REOPENED
+        complaint.resolved_at = None
+        complaint.verified_at = None
+        complaint.is_public = False
+        complaint.save()
+        record_history(
+            complaint,
+            user,
+            "reopened",
+            old_status=old_status,
+            reason=serializer.validated_data["reason"],
+        )
+        return Response(ComplaintSerializer(complaint).data)
+    @action(detail=True, methods=["get"], permission_classes=[
+        IsAuthenticated
+    ])
+    def history(self, request, pk=None):
+        complaint = self.get_object()
+        records = complaint.history.select_related("actor")
+        return Response(
+            ComplaintHistorySerializer(records, many=True).data
+        )
 @api_view(["GET"])
 @permission_classes([AllowAny])
 def public_complaints(request):
     queryset = Complaint.objects.filter(
-        status=Complaint.Status.CLOSED,
-        resolution_verified=True,
         is_public=True,
-    ).select_related("location").order_by("-closed_at")
-
+        status=Complaint.Status.VERIFIED,
+    ).select_related("location").order_by("-updated_at")
     category = request.query_params.get("category")
-    location_id = request.query_params.get("location")
-    search = request.query_params.get("search")
-
     if category:
         queryset = queryset.filter(category=category)
-
-    if location_id:
-        queryset = queryset.filter(location_id=location_id)
-
+    complaint_status = request.query_params.get("status")
+    if complaint_status:
+        queryset = queryset.filter(status=complaint_status)
+    search = request.query_params.get("search")
     if search:
         queryset = queryset.filter(
             Q(title__icontains=search)
-            | Q(description__icontains=search)
+            | Q(category__icontains=search)
+            | Q(location__name__icontains=search)
         )
-
-    data = [
-        {
-            "id": complaint.id,
-            "title": complaint.title,
-            "category": complaint.category,
-            "location": complaint.location.name,
-            "status": complaint.status,
-            "closed_at": complaint.closed_at,
-        }
-        for complaint in queryset
-    ]
-
-    return Response(data)
-
-
+    return Response(
+        PublicComplaintSerializer(queryset, many=True).data
+    )
 @api_view(["GET"])
 @permission_classes([AllowAny])
 def public_stats(request):
-    total = Complaint.objects.count()
-
-    submitted = Complaint.objects.filter(
-        status=Complaint.Status.SUBMITTED
-    ).count()
-
-    in_progress = Complaint.objects.filter(
-        status__in=[
-            Complaint.Status.ASSIGNED,
-            Complaint.Status.IN_PROGRESS,
-        ]
-    ).count()
-
-    closed = Complaint.objects.filter(
-        status=Complaint.Status.CLOSED,
-        resolution_verified=True,
-    ).count()
-
-    rate = round((closed / total) * 100, 2) if total else 0
-
+    queryset = Complaint.objects.filter(
+        is_public=True,
+        status=Complaint.Status.VERIFIED,
+    )
     return Response({
-        "total": total,
-        "pending": submitted,
-        "in_progress": in_progress,
-        "verified_resolved": closed,
-        "resolution_rate": rate,
+        "verified_resolved": queryset.count(),
+        "total_public_complaints": queryset.count(),
     })
-
-# Create your views here.
+@api_view(["GET"])
+@permission_classes([IsAuthenticated, IsManagement])
+def management_analytics(request):
+    queryset = Complaint.objects.all()
+    return Response({
+        "total": queryset.count(),
+        "by_status": list(
+            queryset.values("status").annotate(count=Count("id"))
+        ),
+        "by_category": list(
+            queryset.values("category").annotate(count=Count("id"))
+        ),
+        "by_location": list(
+            queryset.values(
+                "location__name"
+            ).annotate(count=Count("id"))
+        ),
+    })

@@ -15,11 +15,19 @@ Including another URLconf
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 from django.contrib import admin
-from django.urls import path,include
-
+from django.urls import include, path
+from django.http import JsonResponse
+from rest_framework_simplejwt.views import TokenVerifyView
+def api_home(request):
+    return JsonResponse({
+        "project": "CampusPulse",
+        "message": "CampusPulse API is running.",
+    })
 urlpatterns = [
-    path('admin/', admin.site.urls),
-    path('api/auth/',include('accounts.urls')),
-    path("api/",include("campus.urls")),
-    path("api/",include("complaints.urls")),
+    path("admin/", admin.site.urls),
+    path("api/", api_home, name="api-home"),
+    path("api/auth/", include("accounts.urls")),
+    path("api/", include("campus.urls")),
+    path("api/", include("complaints.urls")),
+    path("api/auth/token/verify/", TokenVerifyView.as_view()),
 ]
