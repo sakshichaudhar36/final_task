@@ -20,40 +20,7 @@ class RegisterView(generics.CreateAPIView):
     queryset = User.objects.all()
     serializer_class = RegisterSerializer
     permission_classes = [AllowAny]
-class VerifyEmailView(APIView):
-    permission_classes = [AllowAny]
 
-    def get(self, request):
-        token = request.query_params.get("token")
-
-        if not token:
-            return Response(
-                {"detail": "Verification token is required."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        try:
-            data = signing.loads(
-                token,
-                salt="campuspulse-email-verification",
-                max_age=86400,
-            )
-            user = User.objects.get(pk=data["user_id"])
-        except (signing.BadSignature, signing.SignatureExpired,
-                User.DoesNotExist, KeyError, TypeError):
-            return Response(
-                {"detail": "Invalid or expired verification link."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        if user.email_verified:
-            return Response({"detail": "Email already verified."})
-        user.email_verified = True
-        user.is_active = True
-        user.save(update_fields=["email_verified", "is_active"])
-
-        return Response({
-            "detail": "College email verified. You can now log in."
-        })
 class LoginView(TokenObtainPairView):
     permission_classes = [AllowAny]
     serializer_class = CampusPulseTokenSerializer
