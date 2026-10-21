@@ -186,8 +186,7 @@ CORS_ALLOWED_ORIGINS = [
 CORS_ALLOWED_ORIGINS = [
     "https://campuspulse-web.vercel.app",
     "http://localhost:5173",
+    "https://final-task-3-90te.onrender.com",
+    "https://campus-pulse-model.onrender.com",
 ]
 
-CSRF_TRUSTED_ORIGINS = [
-    "https://campuspulse-web.vercel.app",
-]
