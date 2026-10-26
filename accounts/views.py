@@ -1,7 +1,5 @@
-from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.core import signing
-from django.http import HttpResponse
+from django.contrib.auth.hashers import check_password
 from django.utils import timezone
 from rest_framework import generics, status
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -20,7 +18,59 @@ class RegisterView(generics.CreateAPIView):
     queryset = User.objects.all()
     serializer_class = RegisterSerializer
     permission_classes = [AllowAny]
-
+class VerifyEmailOTPView(APIView):
+    permission_classes = [AllowAny]
+    def post(self, request):
+        email = request.data.get("email", "").strip().lower()
+        otp = str(request.data.get("otp", "")).strip()
+        if not email or not otp:
+            return Response(
+                {"detail": "Email and OTP are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            return Response(
+                {"detail": "Invalid email or OTP."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if user.email_verified:
+            return Response(
+                {"detail": "Email is already verified."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not user.verification_otp_hash or not user.verification_otp_expires_at:
+            return Response(
+                {"detail": "No valid OTP found. Please register again or request a new OTP."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if timezone.now() > user.verification_otp_expires_at:
+            return Response(
+                {"detail": "OTP has expired. Please request a new OTP."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not check_password(otp, user.verification_otp_hash):
+            return Response(
+                {"detail": "Invalid email or OTP."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        user.email_verified = True
+        user.is_active = True
+        user.verification_otp_hash = ""
+        user.verification_otp_expires_at = None
+        user.save(
+            update_fields=[
+                "email_verified",
+                "is_active",
+                "verification_otp_hash",
+                "verification_otp_expires_at",
+            ]
+        )
+        return Response(
+            {"detail": "Email verified successfully. You can now log in."},
+            status=status.HTTP_200_OK,
+        )
 class LoginView(TokenObtainPairView):
     permission_classes = [AllowAny]
     serializer_class = CampusPulseTokenSerializer
